@@ -1,0 +1,137 @@
+######download paired end RNA-Seq data from SRA######
+module load SRA-Toolkit/2.9.0-centos_linux64
+fastq-dump --split-files SRR5970129 # splits files into paired end reads
+
+#######upload reference genome (.fasta) and annotation files (.gff) to working directory using FileZilla
+#reference genome = potato_dm_v404_all_pm_un.fasta
+#annotation - PGSC_DM_V403
+
+######in order to use Tophat2 it requires some manipulation of the data#######
+####The chromosome names on the reference and fasta and the annotation file have to match
+#To check the chromosome names in fasta file
+grep '>' potato_dm_v404_all_pm_un.fasta # result is >chr01, >chr02, >chr03, >chr04, >chr05, >chr06, >chr07, >chr08, >chr09, >chr10, >chr11, >chr12, >chr00, ChrUn
+
+#This differs from the GFF naming of the chromosomes as 'ST4.ch01', etc
+#To change the chromosome names in the annotation files so that it matches the fasta file names
+#sed takes any string that contains "ST4.03ch" and replaces it with "chr" from our GFF file and then writes it to a new GFF file
+sed 's/ST4.03ch/chr/' PGSC_DM_V403_genes.gff > PGSC_DM_V4304_genes1.gff
+
+#Also the annotation file does not include 'ChrUn'
+#To remove 'ChrUN sequence from fasta file
+#opens fasta file scans file for each header/substr. If the substr contains "ChrUn" then it will be removed, else everything else gets sent to a new fasta file
+cat potato_dm_v404_all_un.fasta | awk '{if (substr($0,1) == ">ChrUN") censor=1; else if (substr($0,1,1) == ">") censor=0; if (censor==0) print $0}' > potato_dm_v404_all_pm_un1.fasta
+
+#Tophat will run into a parsing error if there isn't strand information (column 7) in the annotation. In our annotation file, about 7% of the rows are missing strand information and need to be removed
+awk '$7!="."' PGSC_DM_V403_genes1.gff > PGSC_DM_V403_genes2.gff #the seventh colum ($7) contains informatino on the strand direction. 
+                                                                #Values that do not have a '+' or '-' do not have strand information and need to be removed in order for tophat to run. 
+                                                                #Empty values are represented with "."
+
+
+####################FASTQC#######################
+####FastQC is a way of checking the quality of the reads generated. 
+
+#create a subset of reads
+head -n 3000000 Missaukee_Leaf1_PE1.fastq > Missuakee_Leaf1_PE1_subset.fastq
+head -n 3000000 Missaukee_Leaf1_PE2.fastq > Missuakee_Leaf1_PE2_subset.fastq
+
+#run FastQC
+module load FastQC/0.11.5-Java-1.8.0_162 #load FastQC 
+fastqc -o . -f fastq Missuakee_Leaf1_PE1_subset.fastq Missuakee_Leaf1_PE2_subset.fastq #run fastqc outputting (-o) results into working directory (.), specifying the file type (-f) are .fastq, and then list the subsetted PE read files seperated by a space
+#view output files to check read quality
+
+
+###################CutAdapt\1.14##################
+####removes adapters and low quality reads
+####Most aligners do not need you to remove the adapters/ low quality reads as there are filtering steps where it's done in the alignment software
+####But we are going to do it anyway
+
+module load icc/2017.1.132-GCC-6.3.0-2.27 impi/2017.1.132 cutadapt/1.14-Python-3.6.1
+
+cutadapt \ #run cutadapt to clean paired end read files
+-f fastq \ #file type is fastq
+-q 30,30 \ #trim bases with quality score less than 30 from beginning and end of read
+--trim-n \ #trim "N" bases
+-m 100 \ #minimum read length after trimming, remove reads that are less than 100 bp
+-n 3 \ #remove up to 4 adapters from read ends
+-a -CAAGCAGAAGACGGCATACGAGATACGGAACTGTGACTGGAGTTCAGACGTGTGCTCTTCCGATC\ #Adapter with NEB barcode for read 1
+-A AGATCGGAAGCGTCGTCGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT\ #reverse compliment of illumina universal adapter for read 2
+-o Missaukee_Leaf1_PE1.fastq \ #output file for read 1
+-p Missaukee_Leaf1_PE2.fastq \ #output file for read 2
+Missaukee_Leaf1_PE1.fastq \ #Input files for read 1
+Missaukee_Leaf1_PE2.fastq #Input file for read 2
+
+
+####################STAR###################
+module load GCC/7.3.0-2.30 GCCcore/7.3.0 OpenMPI/3.1.1 STAR/2.6.1c 
+
+##Create genome index
+STAR --runMode genomeGenerate\
+--genomeDir STAR_Index\ #Directory where indexes will be stored
+--genomeFastaFiles potato_dm_v404_all_pm_un1.fa #reference FASTA file
+--sjdbGTFfile PGSC_DM_V403_genes2.gff #annotation file
+--sjdbGTFtagExonParentTranscript Parent #if using a GFF file for annotation, must include this option tagging the parent strand
+--sjdbOverhang 149 # read length -1 is the max overhang
+
+#align reads to reference using STAR
+STAR --genomeDIR potato_dm_v404_all_pm_un1_STAR_index\ #this is the directory where the indexes are located
+--readFilesIn Missaukee_L1_PE1.fastq Missaukee_L1_PE2.fastq #a fasa file corrisponding to each paired end read
+
+
+####################HISAT2###################
+module load GCC/4.7.2 hisat2/2.1.0  
+
+##Create genome index
+hisat2-build potato_dm_v404_all_pm_un1.fa\ #reference input
+potato_dm_v404_all_pm_un1.fa #basename for index
+
+##Align reads to reference
+hisat2 -x potato_dm_v404_all_pm_un1 -1 Missaukee_Leaf1_PE1.fastq -2 Missaukee_Leaf1_PE2.fastq \
+-S HISAT2_Final.sam --sumary-file HISAT2_Summary.txt
+
+####################Tophat2/2.1.1###################
+
+module load GCC/5.4.0-2.26 OpenMPI/1.10.3 Bowtie2/2.2.3 TopHat/2.1.1 SAMtools/1.5
+
+#######Index refernce genome using Bowtie2########
+#Tophat uses Bowtie to index genome
+
+bowtie2-build potato_dm_v404_all_pm_un1.fa\ #reference fasta
+potato_dm_v404_all_pm_un1 #index base name, recommended to use the same name as the reference file, or else TopHat might get confused
+
+#To check the chromosome names in indexed reference 
+bowtie2-inspect --names <index_head> #this command pulls the names for the chromosomes of your indexed reference genome (*.bt2)
+
+#Align reads to indexed reference using TopHat2
+
+tophat -o tophat2_results\ #run tophat, output (-o) results into a directory called tophat2_results
+-I 30000\ #max-intron-length set to 30,000. When TopHat searches for junctions, it will ignore donor/acceptor pairs that are farther than 30,000 bases apart. The default is 5,000,000
+--library-type fr-firststrand\ #library type is based on how the RNA was prepared, in the case of this experiment the first-stranded meaning that the right most fragment was the one that was sequenced, 
+                                #this basically spefies the direction the sequence should be read when searching for where it maps to
+-G PGSC_DM_V403_genes1.gff #specificying the genome annotation file 
+potato_dm_v404_all_pm_un1 #the base name to the genome reference
+Missaukee_Leaf1_PE1.fastq Missaukee_Leaf1_PE2.fastq #Paired end read files
+
+
+################Data-Analysis###############
+######number of reads mapping
+#STAR- output file lists this value
+nano log.final.out
+
+#Tophat2
+nano align_summary.txt
+
+#HISAT2 - typically prints summary after running so, there is a command listed in the job script that creates a file for the summary text
+nano HISAT2_Summary.txt
+
+#HISAT2/Tophat2 Samtools stats- must load Samtools to view SAM file statistics file
+module load SAMtools/1.5
+samtools flagstat XXXXXX.sam #reports a list of statistics about reads including the number of reads that mapped
+
+
+
+###### How much CPU time/ memory######
+sacct -j <jobid> --format="MaxRSS,Elapsed" #command from slurm server that allows you to see information about a job that you have already submitted
+
+
+
+
